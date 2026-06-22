@@ -6,6 +6,7 @@
   <title>Invoice Reconciler</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -320,7 +321,8 @@
     document.getElementById(errId).textContent = '';
     document.getElementById(nameId).textContent = 'Loading…';
     try {
-      const { headers, rows } = await parseFile(file);
+      const setStatus = msg => { document.getElementById(nameId).textContent = msg; };
+      const { headers, rows } = await parseFile(file, setStatus);
       state[key].headers = headers;
       state[key].rows    = rows;
       state[key].file    = file;
@@ -335,15 +337,15 @@
   }
 
   // ── File parsers ───────────────────────────────────────────────────────────
-  async function parseFile(file) {
+  async function parseFile(file, setStatus) {
     const ext = file.name.split('.').pop().toLowerCase();
-    if (ext === 'pdf')                return parsePDF(file);
+    if (ext === 'pdf')                return parsePDF(file, setStatus);
     if (ext === 'csv')                return parseCSV(file);
     if (ext === 'xlsx' || ext === 'xls') return parseExcel(file);
     throw new Error('Unsupported file type. Use PDF, CSV, or Excel.');
   }
 
-  async function parsePDF(file) {
+  async function parsePDF(file, setStatus) {
     const buf = await file.arrayBuffer();
     const doc = await pdfjsLib.getDocument({ data: buf }).promise;
     const allLines = [];
@@ -377,11 +379,68 @@
       }
     }
 
-    if (allLines.length === 0) throw new Error('No text found in PDF.');
+    // If pdf.js found no text this is a scanned/image PDF — fall back to OCR
+    if (allLines.length === 0) {
+      if (setStatus) setStatus('Scanned PDF detected — running OCR (this may take 30–60 s)…');
+      return parsePDFWithOCR(doc, setStatus);
+    }
 
+    return structureLines(allLines);
+  }
+
+  // Render each PDF page to a canvas and run Tesseract OCR on it
+  async function parsePDFWithOCR(doc, setStatus) {
+    // Initialise Tesseract worker
+    const worker = await Tesseract.createWorker('eng', 1, {
+      logger: m => {
+        if (setStatus && m.status === 'recognizing text') {
+          setStatus(`OCR: ${Math.round(m.progress * 100)}%…`);
+        }
+      }
+    });
+
+    const allLines = [];
+
+    for (let p = 1; p <= doc.numPages; p++) {
+      const page     = await doc.getPage(p);
+      const viewport = page.getViewport({ scale: 2.5 }); // higher scale = better OCR
+      const canvas   = document.createElement('canvas');
+      canvas.width   = viewport.width;
+      canvas.height  = viewport.height;
+      const ctx      = canvas.getContext('2d');
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      const { data } = await worker.recognize(canvas);
+
+      // Tesseract gives us words with bounding boxes — group into rows by y-mid
+      const words = data.words.filter(w => w.text.trim());
+      const groups = [];
+      for (const w of words) {
+        const yMid = (w.bbox.y0 + w.bbox.y1) / 2;
+        const grp  = groups.find(g => Math.abs(g.y - yMid) <= 10);
+        if (grp) {
+          grp.items.push({ x: w.bbox.x0, text: w.text.trim() });
+        } else {
+          groups.push({ y: yMid, items: [{ x: w.bbox.x0, text: w.text.trim() }] });
+        }
+      }
+      groups.sort((a, b) => a.y - b.y);
+      for (const g of groups) {
+        g.items.sort((a, b) => a.x - b.x);
+        const row = g.items.map(i => i.text).filter(Boolean);
+        if (row.length > 0) allLines.push(row);
+      }
+    }
+
+    await worker.terminate();
+
+    if (allLines.length === 0) throw new Error('OCR found no text in PDF. Try a higher-quality scan.');
+    return structureLines(allLines);
+  }
+
+  // Shared: find header row and build structured rows from raw line arrays
+  function structureLines(allLines) {
     // Find the header row by scoring against known invoice column keywords.
-    // This handles invoices like Cali Gourmet where the header row contains
-    // "Quantity", "Description", "Unit Price", "Total Price", etc.
     const headerKeywords = ['quantity','description','unit price','total price','unit','total','item'];
     let headerIdx = -1;
     let bestScore = 0;
@@ -398,13 +457,10 @@
 
     const headers = allLines[headerIdx];
 
-    // Build data rows. Skip rows that look like notes/warnings (no numeric
-    // content and only 1-2 tokens) to avoid misaligning columns.
+    // Skip note-only rows (Prop. 65 warnings, etc.) that would misalign columns
     const dataLines = allLines.slice(headerIdx + 1).filter(r => {
       if (r.length < 2) return false;
-      // Keep rows that have at least one numeric-looking token
       const hasNum = r.some(t => /\d/.test(t));
-      // But also keep if the row is wide enough to be a real line item
       return hasNum || r.length >= 4;
     });
 
