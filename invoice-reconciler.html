@@ -330,7 +330,9 @@
       zone.classList.add('loaded');
       maybeShowMapping();
     } catch(e) {
-      document.getElementById(errId).textContent = `Error: ${e.message}`;
+      const msg = e.message || String(e);
+      document.getElementById(errId).textContent = `Error: ${msg}`;
+      console.error('Invoice load error:', e);
       document.getElementById(nameId).textContent = '';
       zone.classList.remove('loaded');
     }
@@ -390,30 +392,31 @@
 
   // Render each PDF page to a canvas and run Tesseract OCR on it
   async function parsePDFWithOCR(doc, setStatus) {
-    // Initialise Tesseract worker
-    const worker = await Tesseract.createWorker('eng', 1, {
-      logger: m => {
-        if (setStatus && m.status === 'recognizing text') {
-          setStatus(`OCR: ${Math.round(m.progress * 100)}%…`);
-        }
-      }
-    });
-
     const allLines = [];
 
     for (let p = 1; p <= doc.numPages; p++) {
+      if (setStatus) setStatus(`OCR: rendering page ${p} of ${doc.numPages}…`);
+
       const page     = await doc.getPage(p);
-      const viewport = page.getViewport({ scale: 2.5 }); // higher scale = better OCR
+      const viewport = page.getViewport({ scale: 2.5 });
       const canvas   = document.createElement('canvas');
       canvas.width   = viewport.width;
       canvas.height  = viewport.height;
-      const ctx      = canvas.getContext('2d');
-      await page.render({ canvasContext: ctx, viewport }).promise;
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
 
-      const { data } = await worker.recognize(canvas);
+      if (setStatus) setStatus(`OCR: reading page ${p} of ${doc.numPages} (may take ~30s)…`);
 
-      // Tesseract gives us words with bounding boxes — group into rows by y-mid
-      const words = data.words.filter(w => w.text.trim());
+      // Tesseract.js v5 simple API — no worker setup needed
+      const result = await Tesseract.recognize(canvas, 'eng', {
+        logger: m => {
+          if (setStatus && m.status === 'recognizing text') {
+            setStatus(`OCR page ${p}: ${Math.round((m.progress || 0) * 100)}%…`);
+          }
+        }
+      });
+
+      // Group words into rows by y-midpoint with 10px tolerance
+      const words = (result.data.words || []).filter(w => w.text && w.text.trim());
       const groups = [];
       for (const w of words) {
         const yMid = (w.bbox.y0 + w.bbox.y1) / 2;
@@ -432,9 +435,7 @@
       }
     }
 
-    await worker.terminate();
-
-    if (allLines.length === 0) throw new Error('OCR found no text in PDF. Try a higher-quality scan.');
+    if (allLines.length === 0) throw new Error('OCR found no text. Try a clearer scan or export the invoice as a digital PDF.');
     return structureLines(allLines);
   }
 
