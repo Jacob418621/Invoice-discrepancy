@@ -344,42 +344,75 @@
   }
 
   async function parsePDF(file) {
-    const buf  = await file.arrayBuffer();
-    const doc  = await pdfjsLib.getDocument({ data: buf }).promise;
-    const lines = [];
+    const buf = await file.arrayBuffer();
+    const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+    const allLines = [];
 
     for (let p = 1; p <= doc.numPages; p++) {
       const page    = await doc.getPage(p);
       const content = await page.getTextContent();
 
-      // Group items by approximate Y position to reconstruct rows
-      const byY = {};
+      // Group items by Y with a tolerance of 5pt so items on the same visual
+      // row (which can differ slightly in Y) land in the same bucket.
+      const groups = [];
       for (const item of content.items) {
-        const y = Math.round(item.transform[5]);
-        if (!byY[y]) byY[y] = [];
-        byY[y].push({ x: item.transform[4], text: item.str.trim() });
+        const y    = item.transform[5];
+        const x    = item.transform[4];
+        const text = item.str.trim();
+        if (!text) continue;
+        const grp = groups.find(g => Math.abs(g.y - y) <= 5);
+        if (grp) {
+          grp.items.push({ x, text });
+        } else {
+          groups.push({ y, items: [{ x, text }] });
+        }
       }
 
-      const ys = Object.keys(byY).map(Number).sort((a, b) => b - a);
-      for (const y of ys) {
-        const row = byY[y].sort((a, b) => a.x - b.x).map(i => i.text).filter(Boolean);
-        if (row.length > 1) lines.push(row);
+      // Top-to-bottom order; within each row left-to-right
+      groups.sort((a, b) => b.y - a.y);
+      for (const g of groups) {
+        g.items.sort((a, b) => a.x - b.x);
+        const row = g.items.map(i => i.text).filter(Boolean);
+        if (row.length > 0) allLines.push(row);
       }
     }
 
-    if (lines.length === 0) throw new Error('No text found in PDF.');
+    if (allLines.length === 0) throw new Error('No text found in PDF.');
 
-    // Heuristic: find the row with the most columns — treat as header
-    const maxCols = Math.max(...lines.map(r => r.length));
-    const headerIdx = lines.findIndex(r => r.length === maxCols);
-    const headers = lines[headerIdx];
-    const rows = lines.slice(headerIdx + 1)
-      .filter(r => r.length >= 2)
-      .map(r => {
-        const obj = {};
-        headers.forEach((h, i) => { obj[h] = r[i] ?? ''; });
-        return obj;
-      });
+    // Find the header row by scoring against known invoice column keywords.
+    // This handles invoices like Cali Gourmet where the header row contains
+    // "Quantity", "Description", "Unit Price", "Total Price", etc.
+    const headerKeywords = ['quantity','description','unit price','total price','unit','total','item'];
+    let headerIdx = -1;
+    let bestScore = 0;
+    for (let i = 0; i < Math.min(allLines.length, 40); i++) {
+      const rowText = allLines[i].join(' ').toLowerCase();
+      const score   = headerKeywords.filter(kw => rowText.includes(kw)).length;
+      if (score > bestScore) { bestScore = score; headerIdx = i; }
+    }
+    // Fallback: row with most columns
+    if (headerIdx === -1 || bestScore < 2) {
+      const maxCols = Math.max(...allLines.map(r => r.length));
+      headerIdx = allLines.findIndex(r => r.length === maxCols);
+    }
+
+    const headers = allLines[headerIdx];
+
+    // Build data rows. Skip rows that look like notes/warnings (no numeric
+    // content and only 1-2 tokens) to avoid misaligning columns.
+    const dataLines = allLines.slice(headerIdx + 1).filter(r => {
+      if (r.length < 2) return false;
+      // Keep rows that have at least one numeric-looking token
+      const hasNum = r.some(t => /\d/.test(t));
+      // But also keep if the row is wide enough to be a real line item
+      return hasNum || r.length >= 4;
+    });
+
+    const rows = dataLines.map(r => {
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = r[i] ?? ''; });
+      return obj;
+    });
 
     return { headers, rows };
   }
@@ -476,11 +509,15 @@
   function autoMatch(header, fieldKey) {
     const h = header.toLowerCase().replace(/[^a-z]/g, '');
     const matchers = {
-      description: ['description','desc','item','product','name','sku','service','detail'],
-      qty:         ['qty','quantity','units','count','amount'],
+      description: ['description','desc','product','name','service','detail'],
+      qty:         ['qty','quantity','units','count'],
       unitPrice:   ['unitprice','unit','price','rate','cost','each','perprice'],
-      total:       ['total','linetotal','extended','ext','subtotal','amount'],
+      // "Total Price" → totalprice; "Line Total" → linetotal; etc.
+      // Exclude "unitprice" so the unit price column doesn't also match total.
+      total:       ['totalprice','linetotal','extended','ext','totalamount'],
     };
+    // Special case: a header that is exactly "Total" (not "Unit Price") matches total
+    if (fieldKey === 'total' && h === 'total') return true;
     return (matchers[fieldKey] || []).some(m => h.includes(m));
   }
 
@@ -576,7 +613,12 @@
 
   function parseNum(val) {
     if (val === undefined || val === null || val === '') return null;
-    const n = parseFloat(String(val).replace(/[$,\s]/g, ''));
+    // Strip currency symbols, commas, and trailing unit labels like "Cs", "cs", "EA", "lbs"
+    const cleaned = String(val)
+      .replace(/[$,]/g, '')
+      .replace(/\s*(Cs|cs|CS|EA|ea|lbs?|oz|kg|unit|units|each)\s*$/i, '')
+      .trim();
+    const n = parseFloat(cleaned);
     return isNaN(n) ? null : n;
   }
 
