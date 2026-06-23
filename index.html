@@ -255,22 +255,9 @@
     </div>
   </div>
 
-  <!-- Column mapping -->
-  <div class="mapping-section" id="mappingSection">
-    <div class="mapping-grid">
-      <div class="mapping-panel" id="invoiceMapping">
-        <h3>Invoice — Map Columns</h3>
-        <!-- populated by JS -->
-      </div>
-      <div class="mapping-panel" id="costMapping">
-        <h3>Cost Sheet — Map Columns</h3>
-        <!-- populated by JS -->
-      </div>
-    </div>
-    <div style="margin-top:16px;">
-      <button id="compareBtn" disabled>Compare</button>
-      <button class="secondary" id="resetBtn" style="margin-left:8px;">Reset</button>
-    </div>
+  <!-- Reset button -->
+  <div id="resetBar" style="display:none; margin-bottom:20px;">
+    <button class="secondary" id="resetBtn">↺ Start Over</button>
   </div>
 
   <!-- Results -->
@@ -328,7 +315,7 @@
       state[key].file    = file;
       document.getElementById(nameId).textContent = `✓ ${file.name} — ${rows.length} rows`;
       zone.classList.add('loaded');
-      maybeShowMapping();
+      maybeAutoCompare();
     } catch(e) {
       const msg = e.message || String(e);
       document.getElementById(errId).textContent = `Error: ${msg}`;
@@ -565,80 +552,36 @@
     });
   }
 
-  // ── Column mapping UI ──────────────────────────────────────────────────────
-  const FIELDS = [
-    { key: 'itemNo',      label: 'Item # (for matching)' },
-    { key: 'description', label: 'Description' },
-    { key: 'qty',         label: 'Quantity' },
-    { key: 'unitPrice',   label: 'Unit Price / Cost' },
-    { key: 'total',       label: 'Line Total' },
-  ];
+  // ── Auto-detect columns & compare ─────────────────────────────────────────
+  document.getElementById('resetBtn').addEventListener('click', () => location.reload());
 
-  function maybeShowMapping() {
-    if (!state.invoice.headers.length || !state.cost.headers.length) return;
-    buildMappingPanel('invoiceMapping', 'invoice', 'Invoice');
-    buildMappingPanel('costMapping',    'cost',    'Cost Sheet');
-    document.getElementById('mappingSection').classList.add('visible');
-    document.getElementById('results').classList.remove('visible');
-    document.getElementById('compareBtn').disabled = false;
-  }
-
-  function buildMappingPanel(panelId, key, label) {
-    const panel   = document.getElementById(panelId);
-    const headers = state[key].headers;
-    panel.innerHTML = `<h3>${label} — Map Columns</h3>`;
-
-    for (const field of FIELDS) {
-      const row = document.createElement('div');
-      row.className = 'map-row';
-
-      const lbl = document.createElement('label');
-      lbl.textContent = field.label;
-
-      const sel = document.createElement('select');
-      sel.id = `map_${key}_${field.key}`;
-      sel.innerHTML = `<option value="">(none)</option>` +
-        headers.map(h => `<option value="${esc(h)}"${autoMatch(h, field.key) ? ' selected' : ''}>${esc(h)}</option>`).join('');
-
-      row.appendChild(lbl);
-      row.appendChild(sel);
-      panel.appendChild(row);
-    }
-  }
-
-  function autoMatch(header, fieldKey) {
-    const h = header.toLowerCase().replace(/[^a-z]/g, '');
-    const matchers = {
+  function autoDetectMapping(headers) {
+    const MATCHERS = {
       itemNo:      ['itemno','item','cgn','sku','code','partno','partnumber','itemnumber'],
       description: ['description','desc','product','name','service','detail'],
       qty:         ['qty','quantity','units','count'],
       unitPrice:   ['unitprice','price','rate','cost','each','perprice'],
       total:       ['totalprice','linetotal','extended','ext','totalamount'],
     };
-    if (fieldKey === 'total' && h === 'total') return true;
-    return (matchers[fieldKey] || []).some(m => h.includes(m));
-  }
-
-  function getMapping(key) {
-    const m = {};
-    for (const field of FIELDS) {
-      m[field.key] = document.getElementById(`map_${key}_${field.key}`)?.value || '';
+    const m = { itemNo: '', description: '', qty: '', unitPrice: '', total: '' };
+    for (const h of headers) {
+      const hk = h.toLowerCase().replace(/[^a-z]/g, '');
+      if (hk === 'total' && !m.total) { m.total = h; continue; }
+      for (const [field, keywords] of Object.entries(MATCHERS)) {
+        if (!m[field] && keywords.some(kw => hk.includes(kw))) { m[field] = h; break; }
+      }
     }
     return m;
   }
 
-  // ── Compare ────────────────────────────────────────────────────────────────
-  document.getElementById('compareBtn').addEventListener('click', compare);
-  document.getElementById('resetBtn').addEventListener('click', () => location.reload());
+  function maybeAutoCompare() {
+    if (!state.invoice.rows.length || !state.cost.rows.length) return;
+    compare();
+  }
 
   function compare() {
-    const invMap  = getMapping('invoice');
-    const costMap = getMapping('cost');
-
-    if (!invMap.description || !costMap.description) {
-      alert('Please map at least the "Description / Item" column for both files.');
-      return;
-    }
+    const invMap  = autoDetectMapping(state.invoice.headers);
+    const costMap = autoDetectMapping(state.cost.headers);
 
     const invItems  = normaliseRows(state.invoice.rows, invMap);
     const costItems = normaliseRows(state.cost.rows,    costMap);
@@ -711,6 +654,7 @@
     }
 
     renderResults(results);
+    document.getElementById('resetBar').style.display = 'block';
   }
 
   function normaliseRows(rows, mapping) {
