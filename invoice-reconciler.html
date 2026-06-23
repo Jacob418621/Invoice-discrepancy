@@ -511,11 +511,53 @@
       const reader = new FileReader();
       reader.onload = e => {
         try {
-          const wb   = XLSX.read(e.target.result, { type: 'array' });
-          const ws   = wb.Sheets[wb.SheetNames[0]];
-          const data = XLSX.utils.sheet_to_json(ws, { defval: '' });
-          const headers = data.length ? Object.keys(data[0]) : [];
-          resolve({ headers, rows: data });
+          const wb = XLSX.read(e.target.result, { type: 'array' });
+
+          // Combine all sheets into one dataset, tagging each row with its sheet name
+          const allRows = [];
+          const headerSet = new Set();
+
+          for (const sheetName of wb.SheetNames) {
+            const ws   = wb.Sheets[sheetName];
+            const data = XLSX.utils.sheet_to_json(ws, { defval: '', header: 1 });
+            if (data.length < 2) continue;
+
+            // Find the header row: first row that has more than 1 non-empty cell
+            let hdrIdx = 0;
+            for (let i = 0; i < Math.min(data.length, 10); i++) {
+              const nonempty = data[i].filter(c => String(c).trim()).length;
+              if (nonempty >= 2) { hdrIdx = i; break; }
+            }
+
+            const rawHeaders = data[hdrIdx].map((h, i) => {
+              const s = String(h).trim();
+              return s || `Col${i}`;
+            });
+            rawHeaders.forEach(h => headerSet.add(h));
+
+            // Category-only rows to skip (single non-empty cell, no price)
+            const CATEGORY_NAMES = /^(candy|chocolate|fruits?|nuts?|seeds?|dried|snacks?|mixes?|other)$/i;
+
+            for (let i = hdrIdx + 1; i < data.length; i++) {
+              const rowArr = data[i];
+              const obj = {};
+              rawHeaders.forEach((h, ci) => { obj[h] = String(rowArr[ci] ?? '').trim(); });
+
+              // Skip blank rows and category-header rows
+              const vals = Object.values(obj).filter(v => v);
+              if (vals.length === 0) continue;
+              if (vals.length === 1 && CATEGORY_NAMES.test(vals[0])) continue;
+              // Skip rows where the only populated cell is a section title (no digits anywhere)
+              if (!vals.some(v => /\d/.test(v))) continue;
+
+              obj['__sheet'] = sheetName;
+              allRows.push(obj);
+            }
+          }
+
+          const headers = [...headerSet].filter(h => !h.startsWith('Col'));
+          if (allRows.length === 0) throw new Error('No data rows found in Excel file.');
+          resolve({ headers, rows: allRows });
         } catch(e) { reject(e); }
       };
       reader.onerror = () => reject(new Error('Failed to read file'));
@@ -525,9 +567,10 @@
 
   // ── Column mapping UI ──────────────────────────────────────────────────────
   const FIELDS = [
-    { key: 'description', label: 'Description / Item' },
+    { key: 'itemNo',      label: 'Item # (for matching)' },
+    { key: 'description', label: 'Description' },
     { key: 'qty',         label: 'Quantity' },
-    { key: 'unitPrice',   label: 'Unit Price' },
+    { key: 'unitPrice',   label: 'Unit Price / Cost' },
     { key: 'total',       label: 'Line Total' },
   ];
 
@@ -566,14 +609,12 @@
   function autoMatch(header, fieldKey) {
     const h = header.toLowerCase().replace(/[^a-z]/g, '');
     const matchers = {
+      itemNo:      ['itemno','item','cgn','sku','code','partno','partnumber','itemnumber'],
       description: ['description','desc','product','name','service','detail'],
       qty:         ['qty','quantity','units','count'],
-      unitPrice:   ['unitprice','unit','price','rate','cost','each','perprice'],
-      // "Total Price" → totalprice; "Line Total" → linetotal; etc.
-      // Exclude "unitprice" so the unit price column doesn't also match total.
+      unitPrice:   ['unitprice','price','rate','cost','each','perprice'],
       total:       ['totalprice','linetotal','extended','ext','totalamount'],
     };
-    // Special case: a header that is exactly "Total" (not "Unit Price") matches total
     if (fieldKey === 'total' && h === 'total') return true;
     return (matchers[fieldKey] || []).some(m => h.includes(m));
   }
@@ -602,14 +643,22 @@
     const invItems  = normaliseRows(state.invoice.rows, invMap);
     const costItems = normaliseRows(state.cost.rows,    costMap);
 
+    // Build lookup by item# (preferred) and by description (fallback)
+    const costByItem = {};
     const costByDesc = {};
-    for (const item of costItems) costByDesc[norm(item.description)] = item;
+    for (const item of costItems) {
+      if (item.itemNo) costByItem[norm(item.itemNo)] = item;
+      costByDesc[norm(item.description)] = item;
+    }
+
+    const useItemNo = invItems.some(r => r.itemNo) && costItems.some(r => r.itemNo);
 
     const results = [];
 
     for (const inv of invItems) {
-      const key  = norm(inv.description);
-      const cost = costByDesc[key];
+      const cost = useItemNo && inv.itemNo
+        ? (costByItem[norm(inv.itemNo)] || costByDesc[norm(inv.description)])
+        : costByDesc[norm(inv.description)];
 
       if (!cost) {
         results.push({ ...inv, status: 'missing', note: 'Not found in cost sheet' });
@@ -647,11 +696,17 @@
       }
 
       results.push({ ...inv, costRow: cost, status, issues });
-      delete costByDesc[key];
+      // Remove matched item from both lookups
+      if (useItemNo && inv.itemNo) delete costByItem[norm(inv.itemNo)];
+      delete costByDesc[norm(inv.description)];
     }
 
-    // Remaining cost items not in invoice
-    for (const item of Object.values(costByDesc)) {
+    // Remaining cost items not matched to any invoice line
+    const seen = new Set();
+    for (const item of [...Object.values(costByItem), ...Object.values(costByDesc)]) {
+      const k = norm(item.itemNo || item.description);
+      if (seen.has(k)) continue;
+      seen.add(k);
       results.push({ ...item, status: 'extra', note: 'In cost sheet but not in invoice' });
     }
 
@@ -660,22 +715,23 @@
 
   function normaliseRows(rows, mapping) {
     return rows.map(r => ({
-      description: r[mapping.description] ?? '',
+      itemNo:      String(r[mapping.itemNo] ?? '').trim(),
+      description: String(r[mapping.description] ?? '').trim(),
       qty:         parseNum(r[mapping.qty]),
       unitPrice:   parseNum(r[mapping.unitPrice]),
       total:       parseNum(r[mapping.total]),
       _raw: r,
-    })).filter(r => r.description.trim());
+    })).filter(r => r.description.trim() || r.itemNo.trim());
   }
 
   function parseNum(val) {
     if (val === undefined || val === null || val === '') return null;
-    // Strip currency symbols, commas, and trailing unit labels like "Cs", "cs", "EA", "lbs"
-    const cleaned = String(val)
-      .replace(/[$,]/g, '')
-      .replace(/\s*(Cs|cs|CS|EA|ea|lbs?|oz|kg|unit|units|each)\s*$/i, '')
-      .trim();
-    const n = parseFloat(cleaned);
+    const s = String(val);
+    // Extract the last number in the string — handles "$6.25lb", "N/A- $3lb", "110.00 Cs"
+    const match = s.match(/(\d[\d.,]*)\s*(?:lb|lbs|oz|kg|Cs|cs|CS|EA|ea|each)?$/i)
+                || s.match(/\d[\d.,]*/);
+    if (!match) return null;
+    const n = parseFloat(match[0].replace(/,/g, ''));
     return isNaN(n) ? null : n;
   }
 
@@ -758,6 +814,7 @@
     document.getElementById('resultsHead').innerHTML = `
       <tr>
         <th>Status</th>
+        <th>Item #</th>
         <th>Description</th>
         <th>Invoice Qty</th><th>Cost Sheet Qty</th>
         <th>Invoice Price</th><th>Cost Sheet Price</th>
@@ -796,7 +853,8 @@
 
       tr.innerHTML = `
         <td>${statusBadge}</td>
-        <td>${esc(r.description)}</td>
+        <td style="font-size:0.78rem">${esc(r.itemNo || costR.itemNo || '')}</td>
+        <td>${esc(r.description || costR.description || '')}</td>
         <td>${fmtNum(r.qty,       costR.qty)}</td>
         <td>${fmtNum(costR.qty,   r.qty)}</td>
         <td>${fmtNum(r.unitPrice, costR.unitPrice)}</td>
@@ -809,7 +867,7 @@
     }
 
     if (filtered.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:#888;padding:30px;">No rows match this filter.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:#888;padding:30px;">No rows match this filter.</td></tr>`;
     }
   }
 
