@@ -560,10 +560,11 @@
       itemNo:      ['itemno','item','cgn','sku','code','partno','partnumber','itemnumber'],
       description: ['description','desc','product','name','service','detail'],
       qty:         ['qty','quantity','units','count'],
+      caseWeight:  ['caseweight','casenet','netweight','casesize','weight','wt'],
       unitPrice:   ['unitprice','price','rate','cost','each','perprice'],
       total:       ['totalprice','linetotal','extended','ext','totalamount'],
     };
-    const m = { itemNo: '', description: '', qty: '', unitPrice: '', total: '' };
+    const m = { itemNo: '', description: '', qty: '', caseWeight: '', unitPrice: '', total: '' };
     for (const h of headers) {
       const hk = h.toLowerCase().replace(/[^a-z]/g, '');
       if (hk === 'total' && !m.total) { m.total = h; continue; }
@@ -612,10 +613,36 @@
       let status = 'ok';
 
       if (inv.unitPrice !== null && cost.unitPrice !== null) {
-        const diff = inv.unitPrice - cost.unitPrice;
-        if (Math.abs(diff) > 0.01) {
-          issues.push({ field: 'Unit Price', inv: inv.unitPrice, cost: cost.unitPrice, diff });
-          status = 'price';
+        // Invoice is $/case; cost sheet is $/lb.
+        // Use case weight (from description or cost sheet) to convert invoice → $/lb.
+        const caseWt = inv.caseWeight || cost.caseWeight || null;
+        const invPricePerLb  = caseWt ? +(inv.unitPrice  / caseWt).toFixed(4) : null;
+        const costPricePerLb = cost.unitPrice; // cost sheet is already $/lb
+
+        // Store converted value on the result for display
+        inv._invPricePerLb  = invPricePerLb;
+        inv._caseWt         = caseWt;
+
+        if (invPricePerLb !== null) {
+          const diff = invPricePerLb - costPricePerLb;
+          if (Math.abs(diff) > 0.005) {
+            issues.push({
+              field: 'Price/lb',
+              inv:  invPricePerLb,
+              cost: costPricePerLb,
+              diff,
+              note: `Invoice $${inv.unitPrice}/Cs ÷ ${caseWt}lb = $${invPricePerLb.toFixed(4)}/lb vs cost sheet $${costPricePerLb}/lb`
+            });
+            status = 'price';
+          }
+        } else {
+          // No weight available — compare raw prices and flag if different
+          const diff = inv.unitPrice - cost.unitPrice;
+          if (Math.abs(diff) > 0.01) {
+            issues.push({ field: 'Unit Price', inv: inv.unitPrice, cost: cost.unitPrice, diff,
+              note: 'Could not determine case weight — raw price compared' });
+            status = 'price';
+          }
         }
       }
 
@@ -625,16 +652,6 @@
           if (status === 'price') status = 'both';
           else status = 'qty';
           issues.push({ field: 'Quantity', inv: inv.qty, cost: cost.qty, diff });
-        }
-      }
-
-      if (inv.total !== null && cost.total !== null) {
-        const diff = inv.total - cost.total;
-        if (Math.abs(diff) > 0.01) {
-          if (!issues.find(i => i.field === 'Unit Price') && !issues.find(i => i.field === 'Quantity')) {
-            status = 'price';
-          }
-          issues.push({ field: 'Line Total', inv: inv.total, cost: cost.total, diff });
         }
       }
 
@@ -658,14 +675,25 @@
   }
 
   function normaliseRows(rows, mapping) {
-    return rows.map(r => ({
-      itemNo:      String(r[mapping.itemNo] ?? '').trim(),
-      description: String(r[mapping.description] ?? '').trim(),
-      qty:         parseNum(r[mapping.qty]),
-      unitPrice:   parseNum(r[mapping.unitPrice]),
-      total:       parseNum(r[mapping.total]),
-      _raw: r,
-    })).filter(r => r.description.trim() || r.itemNo.trim());
+    return rows.map(r => {
+      const description = String(r[mapping.description] ?? '').trim();
+      // Extract case weight: prefer explicit column, fall back to parsing from description
+      // e.g. "Banana Chips 14lb" → 14, "Squash Seed 20lb" → 20
+      let caseWeight = parseNum(r[mapping.caseWeight]);
+      if (!caseWeight) {
+        const m = description.match(/(\d+)\s*lb/i);
+        if (m) caseWeight = parseFloat(m[1]);
+      }
+      return {
+        itemNo:      String(r[mapping.itemNo] ?? '').trim(),
+        description,
+        qty:         parseNum(r[mapping.qty]),
+        caseWeight,
+        unitPrice:   parseNum(r[mapping.unitPrice]),
+        total:       parseNum(r[mapping.total]),
+        _raw: r,
+      };
+    }).filter(r => r.description.trim() || r.itemNo.trim());
   }
 
   function parseNum(val) {
@@ -760,9 +788,12 @@
         <th>Status</th>
         <th>Item #</th>
         <th>Description</th>
-        <th>Invoice Qty</th><th>Cost Sheet Qty</th>
-        <th>Invoice Price</th><th>Cost Sheet Price</th>
-        <th>Invoice Total</th><th>Cost Sheet Total</th>
+        <th>Case Wt</th>
+        <th>Qty</th>
+        <th>Invoice $/Case</th>
+        <th>Invoice $/lb</th>
+        <th>Cost Sheet $/lb</th>
+        <th>$/lb Diff</th>
         <th>Notes</th>
       </tr>`;
 
@@ -791,27 +822,38 @@
         return `<span class="diff-val ${cls}">${formatted}</span> <span style="font-size:0.75rem;color:#888">(${sign}${diff.toFixed(2)})</span>`;
       };
 
-      const costR = r.costRow || {};
-      const notes = r.note || (r.issues || []).map(i =>
-        `${i.field}: invoice ${i.inv}, cost ${i.cost}`).join('; ');
+      const costR  = r.costRow || {};
+      const caseWt = r._caseWt || r.caseWeight || costR.caseWeight || null;
+      const invPerLb  = r._invPricePerLb ?? (r.unitPrice && caseWt ? +(r.unitPrice / caseWt).toFixed(4) : null);
+      const costPerLb = costR.unitPrice ?? null;
+
+      const lbDiff = (invPerLb !== null && costPerLb !== null)
+        ? +(invPerLb - costPerLb).toFixed(4) : null;
+      const lbDiffHtml = lbDiff === null
+        ? '<span style="color:#aaa">—</span>'
+        : lbDiff === 0 || Math.abs(lbDiff) <= 0.005
+          ? '<span style="color:#080">✓</span>'
+          : `<span class="diff-val ${lbDiff > 0 ? 'diff-neg' : 'diff-pos'}">${lbDiff > 0 ? '+' : ''}$${lbDiff.toFixed(4)}</span>`;
+
+      const notes = r.note || (r.issues || []).map(i => i.note || `${i.field}: invoice $${typeof i.inv==='number'?i.inv.toFixed(4):i.inv}, cost $${typeof i.cost==='number'?i.cost.toFixed(4):i.cost}`).join('; ');
 
       tr.innerHTML = `
         <td>${statusBadge}</td>
         <td style="font-size:0.78rem">${esc(r.itemNo || costR.itemNo || '')}</td>
         <td>${esc(r.description || costR.description || '')}</td>
-        <td>${fmtNum(r.qty,       costR.qty)}</td>
-        <td>${fmtNum(costR.qty,   r.qty)}</td>
-        <td>${fmtNum(r.unitPrice, costR.unitPrice)}</td>
-        <td>${fmtNum(costR.unitPrice, r.unitPrice)}</td>
-        <td>${fmtNum(r.total,     costR.total)}</td>
-        <td>${fmtNum(costR.total, r.total)}</td>
+        <td style="color:#555">${caseWt ? caseWt + 'lb' : '<span style="color:#aaa">—</span>'}</td>
+        <td>${r.qty ?? '<span style="color:#aaa">—</span>'}</td>
+        <td>${r.unitPrice !== null && r.unitPrice !== undefined ? '$' + r.unitPrice.toFixed(2) : '<span style="color:#aaa">—</span>'}</td>
+        <td>${invPerLb !== null ? '$' + invPerLb.toFixed(4) : '<span style="color:#aaa">—</span>'}</td>
+        <td>${costPerLb !== null ? '$' + costPerLb.toFixed(4) : '<span style="color:#aaa">—</span>'}</td>
+        <td>${lbDiffHtml}</td>
         <td style="font-size:0.78rem;color:#555">${esc(notes)}</td>
       `;
       tbody.appendChild(tr);
     }
 
     if (filtered.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:#888;padding:30px;">No rows match this filter.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;color:#888;padding:30px;">No rows match this filter.</td></tr>`;
     }
   }
 
