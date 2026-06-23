@@ -6,6 +6,7 @@
   <title>Invoice Reconciler</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -26,6 +27,7 @@
     header h1 { font-size: 2rem; font-weight: 900; letter-spacing: -1px; }
     header p { margin-top: 4px; color: #555; font-size: 0.95rem; }
 
+    /* ── Upload panels ── */
     .upload-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -64,6 +66,7 @@
       word-break: break-all;
     }
 
+    /* ── Column mapping ── */
     .mapping-section {
       display: none;
       margin-bottom: 30px;
@@ -99,6 +102,9 @@
       background: #fff;
     }
 
+    /* ── Actions ── */
+    .actions { margin-bottom: 30px; display: flex; gap: 12px; flex-wrap: wrap; }
+
     button {
       padding: 10px 22px;
       border: 2px solid #000;
@@ -115,6 +121,7 @@
     button.secondary:hover { background: #f0f0f0; }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
 
+    /* ── Results ── */
     .results { display: none; }
     .results.visible { display: block; }
 
@@ -138,6 +145,7 @@
     .stat.ok { border-color: #080; }
     .stat.ok .num { color: #080; }
 
+    /* Filter tabs */
     .filter-tabs {
       display: flex;
       gap: 0;
@@ -159,6 +167,7 @@
     .filter-tabs button:last-child { border-right: none; }
     .filter-tabs button.active { background: #000; color: #fff; }
 
+    /* Table */
     .table-wrap { overflow-x: auto; }
 
     table {
@@ -199,6 +208,13 @@
     .diff-pos { color: #080; }
     .diff-neg { color: #c00; }
 
+    /* Preview tables */
+    .preview-section { margin-bottom: 30px; }
+    .preview-section h3 { font-size: 0.95rem; font-weight: 700; margin-bottom: 8px; }
+    .preview-table-wrap { overflow-x: auto; max-height: 260px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; }
+    .preview-table-wrap table th { font-size: 0.75rem; padding: 6px 10px; }
+    .preview-table-wrap table td { font-size: 0.75rem; padding: 5px 10px; }
+
     .error-msg { color: #c00; font-size: 0.85rem; margin-top: 8px; font-weight: 600; }
 
     @media (max-width: 700px) {
@@ -213,6 +229,7 @@
     <p>Drop in your invoice and cost sheet to find discrepancies.</p>
   </header>
 
+  <!-- Upload panels -->
   <div class="upload-grid">
     <div class="panel">
       <h2>Invoice</h2>
@@ -238,13 +255,16 @@
     </div>
   </div>
 
+  <!-- Column mapping -->
   <div class="mapping-section" id="mappingSection">
     <div class="mapping-grid">
       <div class="mapping-panel" id="invoiceMapping">
         <h3>Invoice — Map Columns</h3>
+        <!-- populated by JS -->
       </div>
       <div class="mapping-panel" id="costMapping">
         <h3>Cost Sheet — Map Columns</h3>
+        <!-- populated by JS -->
       </div>
     </div>
     <div style="margin-top:16px;">
@@ -253,6 +273,7 @@
     </div>
   </div>
 
+  <!-- Results -->
   <div class="results" id="results">
     <div class="summary-bar" id="summaryBar"></div>
     <div class="filter-tabs" id="filterTabs"></div>
@@ -269,19 +290,23 @@
   pdfjsLib.GlobalWorkerOptions.workerSrc =
     'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
+  // ── State ──────────────────────────────────────────────────────────────────
   const state = {
     invoice: { rows: [], headers: [], file: null },
     cost:    { rows: [], headers: [], file: null },
   };
 
+  // ── Drop zones ─────────────────────────────────────────────────────────────
   setupDropZone('invoiceZone', 'invoiceFile', 'invoice', 'invoiceFileName', 'invoiceError');
   setupDropZone('costZone',    'costFile',    'cost',    'costFileName',    'costError');
 
   function setupDropZone(zoneId, inputId, key, nameId, errId) {
     const zone  = document.getElementById(zoneId);
     const input = document.getElementById(inputId);
+
     zone.addEventListener('click', () => input.click());
     input.addEventListener('change', () => input.files[0] && loadFile(input.files[0], key, nameId, errId, zone));
+
     zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('dragging'); });
     zone.addEventListener('dragleave', ()=> zone.classList.remove('dragging'));
     zone.addEventListener('drop', e => {
@@ -296,7 +321,8 @@
     document.getElementById(errId).textContent = '';
     document.getElementById(nameId).textContent = 'Loading…';
     try {
-      const { headers, rows } = await parseFile(file);
+      const setStatus = msg => { document.getElementById(nameId).textContent = msg; };
+      const { headers, rows } = await parseFile(file, setStatus);
       state[key].headers = headers;
       state[key].rows    = rows;
       state[key].file    = file;
@@ -304,50 +330,147 @@
       zone.classList.add('loaded');
       maybeShowMapping();
     } catch(e) {
-      document.getElementById(errId).textContent = `Error: ${e.message}`;
+      const msg = e.message || String(e);
+      document.getElementById(errId).textContent = `Error: ${msg}`;
+      console.error('Invoice load error:', e);
       document.getElementById(nameId).textContent = '';
       zone.classList.remove('loaded');
     }
   }
 
-  async function parseFile(file) {
+  // ── File parsers ───────────────────────────────────────────────────────────
+  async function parseFile(file, setStatus) {
     const ext = file.name.split('.').pop().toLowerCase();
-    if (ext === 'pdf')                return parsePDF(file);
+    if (ext === 'pdf')                return parsePDF(file, setStatus);
     if (ext === 'csv')                return parseCSV(file);
     if (ext === 'xlsx' || ext === 'xls') return parseExcel(file);
     throw new Error('Unsupported file type. Use PDF, CSV, or Excel.');
   }
 
-  async function parsePDF(file) {
-    const buf  = await file.arrayBuffer();
-    const doc  = await pdfjsLib.getDocument({ data: buf }).promise;
-    const lines = [];
+  async function parsePDF(file, setStatus) {
+    const buf = await file.arrayBuffer();
+    const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+    const allLines = [];
+
     for (let p = 1; p <= doc.numPages; p++) {
       const page    = await doc.getPage(p);
       const content = await page.getTextContent();
-      const byY = {};
+
+      // Group items by Y with a tolerance of 5pt so items on the same visual
+      // row (which can differ slightly in Y) land in the same bucket.
+      const groups = [];
       for (const item of content.items) {
-        const y = Math.round(item.transform[5]);
-        if (!byY[y]) byY[y] = [];
-        byY[y].push({ x: item.transform[4], text: item.str.trim() });
+        const y    = item.transform[5];
+        const x    = item.transform[4];
+        const text = item.str.trim();
+        if (!text) continue;
+        const grp = groups.find(g => Math.abs(g.y - y) <= 5);
+        if (grp) {
+          grp.items.push({ x, text });
+        } else {
+          groups.push({ y, items: [{ x, text }] });
+        }
       }
-      const ys = Object.keys(byY).map(Number).sort((a, b) => b - a);
-      for (const y of ys) {
-        const row = byY[y].sort((a, b) => a.x - b.x).map(i => i.text).filter(Boolean);
-        if (row.length > 1) lines.push(row);
+
+      // Top-to-bottom order; within each row left-to-right
+      groups.sort((a, b) => b.y - a.y);
+      for (const g of groups) {
+        g.items.sort((a, b) => a.x - b.x);
+        const row = g.items.map(i => i.text).filter(Boolean);
+        if (row.length > 0) allLines.push(row);
       }
     }
-    if (lines.length === 0) throw new Error('No text found in PDF.');
-    const maxCols = Math.max(...lines.map(r => r.length));
-    const headerIdx = lines.findIndex(r => r.length === maxCols);
-    const headers = lines[headerIdx];
-    const rows = lines.slice(headerIdx + 1)
-      .filter(r => r.length >= 2)
-      .map(r => {
-        const obj = {};
-        headers.forEach((h, i) => { obj[h] = r[i] ?? ''; });
-        return obj;
+
+    // If pdf.js found no text this is a scanned/image PDF — fall back to OCR
+    if (allLines.length === 0) {
+      if (setStatus) setStatus('Scanned PDF detected — running OCR (this may take 30–60 s)…');
+      return parsePDFWithOCR(doc, setStatus);
+    }
+
+    return structureLines(allLines);
+  }
+
+  // Render each PDF page to a canvas and run Tesseract OCR on it
+  async function parsePDFWithOCR(doc, setStatus) {
+    const allLines = [];
+
+    for (let p = 1; p <= doc.numPages; p++) {
+      if (setStatus) setStatus(`OCR: rendering page ${p} of ${doc.numPages}…`);
+
+      const page     = await doc.getPage(p);
+      const viewport = page.getViewport({ scale: 2.5 });
+      const canvas   = document.createElement('canvas');
+      canvas.width   = viewport.width;
+      canvas.height  = viewport.height;
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+
+      if (setStatus) setStatus(`OCR: reading page ${p} of ${doc.numPages} (may take ~30s)…`);
+
+      // Tesseract.js v5 simple API — no worker setup needed
+      const result = await Tesseract.recognize(canvas, 'eng', {
+        logger: m => {
+          if (setStatus && m.status === 'recognizing text') {
+            setStatus(`OCR page ${p}: ${Math.round((m.progress || 0) * 100)}%…`);
+          }
+        }
       });
+
+      // Group words into rows by y-midpoint with 10px tolerance
+      const words = (result.data.words || []).filter(w => w.text && w.text.trim());
+      const groups = [];
+      for (const w of words) {
+        const yMid = (w.bbox.y0 + w.bbox.y1) / 2;
+        const grp  = groups.find(g => Math.abs(g.y - yMid) <= 10);
+        if (grp) {
+          grp.items.push({ x: w.bbox.x0, text: w.text.trim() });
+        } else {
+          groups.push({ y: yMid, items: [{ x: w.bbox.x0, text: w.text.trim() }] });
+        }
+      }
+      groups.sort((a, b) => a.y - b.y);
+      for (const g of groups) {
+        g.items.sort((a, b) => a.x - b.x);
+        const row = g.items.map(i => i.text).filter(Boolean);
+        if (row.length > 0) allLines.push(row);
+      }
+    }
+
+    if (allLines.length === 0) throw new Error('OCR found no text. Try a clearer scan or export the invoice as a digital PDF.');
+    return structureLines(allLines);
+  }
+
+  // Shared: find header row and build structured rows from raw line arrays
+  function structureLines(allLines) {
+    // Find the header row by scoring against known invoice column keywords.
+    const headerKeywords = ['quantity','description','unit price','total price','unit','total','item'];
+    let headerIdx = -1;
+    let bestScore = 0;
+    for (let i = 0; i < Math.min(allLines.length, 40); i++) {
+      const rowText = allLines[i].join(' ').toLowerCase();
+      const score   = headerKeywords.filter(kw => rowText.includes(kw)).length;
+      if (score > bestScore) { bestScore = score; headerIdx = i; }
+    }
+    // Fallback: row with most columns
+    if (headerIdx === -1 || bestScore < 2) {
+      const maxCols = Math.max(...allLines.map(r => r.length));
+      headerIdx = allLines.findIndex(r => r.length === maxCols);
+    }
+
+    const headers = allLines[headerIdx];
+
+    // Skip note-only rows (Prop. 65 warnings, etc.) that would misalign columns
+    const dataLines = allLines.slice(headerIdx + 1).filter(r => {
+      if (r.length < 2) return false;
+      const hasNum = r.some(t => /\d/.test(t));
+      return hasNum || r.length >= 4;
+    });
+
+    const rows = dataLines.map(r => {
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = r[i] ?? ''; });
+      return obj;
+    });
+
     return { headers, rows };
   }
 
@@ -400,6 +523,7 @@
     });
   }
 
+  // ── Column mapping UI ──────────────────────────────────────────────────────
   const FIELDS = [
     { key: 'description', label: 'Description / Item' },
     { key: 'qty',         label: 'Quantity' },
@@ -420,15 +544,19 @@
     const panel   = document.getElementById(panelId);
     const headers = state[key].headers;
     panel.innerHTML = `<h3>${label} — Map Columns</h3>`;
+
     for (const field of FIELDS) {
       const row = document.createElement('div');
       row.className = 'map-row';
+
       const lbl = document.createElement('label');
       lbl.textContent = field.label;
+
       const sel = document.createElement('select');
       sel.id = `map_${key}_${field.key}`;
       sel.innerHTML = `<option value="">(none)</option>` +
         headers.map(h => `<option value="${esc(h)}"${autoMatch(h, field.key) ? ' selected' : ''}>${esc(h)}</option>`).join('');
+
       row.appendChild(lbl);
       row.appendChild(sel);
       panel.appendChild(row);
@@ -438,11 +566,15 @@
   function autoMatch(header, fieldKey) {
     const h = header.toLowerCase().replace(/[^a-z]/g, '');
     const matchers = {
-      description: ['description','desc','item','product','name','sku','service','detail'],
-      qty:         ['qty','quantity','units','count','amount'],
+      description: ['description','desc','product','name','service','detail'],
+      qty:         ['qty','quantity','units','count'],
       unitPrice:   ['unitprice','unit','price','rate','cost','each','perprice'],
-      total:       ['total','linetotal','extended','ext','subtotal','amount'],
+      // "Total Price" → totalprice; "Line Total" → linetotal; etc.
+      // Exclude "unitprice" so the unit price column doesn't also match total.
+      total:       ['totalprice','linetotal','extended','ext','totalamount'],
     };
+    // Special case: a header that is exactly "Total" (not "Unit Price") matches total
+    if (fieldKey === 'total' && h === 'total') return true;
     return (matchers[fieldKey] || []).some(m => h.includes(m));
   }
 
@@ -454,30 +586,39 @@
     return m;
   }
 
+  // ── Compare ────────────────────────────────────────────────────────────────
   document.getElementById('compareBtn').addEventListener('click', compare);
   document.getElementById('resetBtn').addEventListener('click', () => location.reload());
 
   function compare() {
     const invMap  = getMapping('invoice');
     const costMap = getMapping('cost');
+
     if (!invMap.description || !costMap.description) {
       alert('Please map at least the "Description / Item" column for both files.');
       return;
     }
+
     const invItems  = normaliseRows(state.invoice.rows, invMap);
     const costItems = normaliseRows(state.cost.rows,    costMap);
+
     const costByDesc = {};
     for (const item of costItems) costByDesc[norm(item.description)] = item;
+
     const results = [];
+
     for (const inv of invItems) {
       const key  = norm(inv.description);
       const cost = costByDesc[key];
+
       if (!cost) {
         results.push({ ...inv, status: 'missing', note: 'Not found in cost sheet' });
         continue;
       }
+
       const issues = [];
       let status = 'ok';
+
       if (inv.unitPrice !== null && cost.unitPrice !== null) {
         const diff = inv.unitPrice - cost.unitPrice;
         if (Math.abs(diff) > 0.01) {
@@ -485,6 +626,7 @@
           status = 'price';
         }
       }
+
       if (inv.qty !== null && cost.qty !== null) {
         const diff = inv.qty - cost.qty;
         if (Math.abs(diff) > 0.001) {
@@ -493,6 +635,7 @@
           issues.push({ field: 'Quantity', inv: inv.qty, cost: cost.qty, diff });
         }
       }
+
       if (inv.total !== null && cost.total !== null) {
         const diff = inv.total - cost.total;
         if (Math.abs(diff) > 0.01) {
@@ -502,12 +645,16 @@
           issues.push({ field: 'Line Total', inv: inv.total, cost: cost.total, diff });
         }
       }
+
       results.push({ ...inv, costRow: cost, status, issues });
       delete costByDesc[key];
     }
+
+    // Remaining cost items not in invoice
     for (const item of Object.values(costByDesc)) {
       results.push({ ...item, status: 'extra', note: 'In cost sheet but not in invoice' });
     }
+
     renderResults(results);
   }
 
@@ -523,7 +670,12 @@
 
   function parseNum(val) {
     if (val === undefined || val === null || val === '') return null;
-    const n = parseFloat(String(val).replace(/[$,\s]/g, ''));
+    // Strip currency symbols, commas, and trailing unit labels like "Cs", "cs", "EA", "lbs"
+    const cleaned = String(val)
+      .replace(/[$,]/g, '')
+      .replace(/\s*(Cs|cs|CS|EA|ea|lbs?|oz|kg|unit|units|each)\s*$/i, '')
+      .trim();
+    const n = parseFloat(cleaned);
     return isNaN(n) ? null : n;
   }
 
@@ -531,10 +683,12 @@
     return String(str).toLowerCase().replace(/\s+/g, ' ').trim();
   }
 
+  // ── Render ─────────────────────────────────────────────────────────────────
   let currentFilter = 'all';
 
   function renderResults(results) {
     window._results = results;
+
     const counts = {
       all:     results.length,
       ok:      results.filter(r => r.status === 'ok').length,
@@ -543,6 +697,8 @@
       missing: results.filter(r => r.status === 'missing').length,
       extra:   results.filter(r => r.status === 'extra').length,
     };
+
+    // Summary bar
     const bar = document.getElementById('summaryBar');
     bar.innerHTML = `
       <div class="stat"><div class="num">${counts.all}</div><div class="lbl">Total Lines</div></div>
@@ -552,6 +708,8 @@
       <div class="stat ${counts.missing? 'warn' : ''}"><div class="num">${counts.missing}</div><div class="lbl">Missing</div></div>
       <div class="stat ${counts.extra  ? 'warn' : ''}"><div class="num">${counts.extra}</div><div class="lbl">Extra</div></div>
     `;
+
+    // Filter tabs
     const tabs = document.getElementById('filterTabs');
     const filters = [
       { key: 'all',     label: `All (${counts.all})` },
@@ -570,14 +728,14 @@
       btn.onclick = () => { currentFilter = f.key; renderTable(results); updateTabs(); };
       tabs.appendChild(btn);
     }
+
     renderTable(results);
     document.getElementById('results').classList.add('visible');
   }
 
   function updateTabs() {
     document.querySelectorAll('#filterTabs button').forEach(btn => {
-      btn.classList.toggle('active', btn.textContent.startsWith(
-        currentFilter === 'all' ? 'All' :
+      btn.classList.toggle('active', btn.textContent.startsWith(currentFilter === 'all' ? 'All' :
         currentFilter === 'issues' ? 'Issues' :
         currentFilter === 'ok'     ? 'Match' :
         currentFilter === 'price'  ? 'Price' :
@@ -596,6 +754,7 @@
 
   function renderTable(results) {
     const filtered = filterResults(results);
+
     document.getElementById('resultsHead').innerHTML = `
       <tr>
         <th>Status</th>
@@ -605,10 +764,13 @@
         <th>Invoice Total</th><th>Cost Sheet Total</th>
         <th>Notes</th>
       </tr>`;
+
     const tbody = document.getElementById('resultsBody');
     tbody.innerHTML = '';
+
     for (const r of filtered) {
       const tr = document.createElement('tr');
+
       const statusBadge = {
         ok:      '<span class="badge badge-ok">✓ Match</span>',
         price:   '<span class="badge badge-price">⚠ Price</span>',
@@ -617,6 +779,7 @@
         missing: '<span class="badge badge-missing">✗ Missing</span>',
         extra:   '<span class="badge badge-extra">+ Extra</span>',
       }[r.status] || '';
+
       const fmtNum = (v, ref) => {
         if (v === null || v === undefined) return '<span style="color:#aaa">—</span>';
         const formatted = typeof v === 'number' ? v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 }) : v;
@@ -626,9 +789,11 @@
         const sign = diff > 0 ? '+' : '';
         return `<span class="diff-val ${cls}">${formatted}</span> <span style="font-size:0.75rem;color:#888">(${sign}${diff.toFixed(2)})</span>`;
       };
+
       const costR = r.costRow || {};
       const notes = r.note || (r.issues || []).map(i =>
         `${i.field}: invoice ${i.inv}, cost ${i.cost}`).join('; ');
+
       tr.innerHTML = `
         <td>${statusBadge}</td>
         <td>${esc(r.description)}</td>
@@ -642,6 +807,7 @@
       `;
       tbody.appendChild(tr);
     }
+
     if (filtered.length === 0) {
       tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:#888;padding:30px;">No rows match this filter.</td></tr>`;
     }
